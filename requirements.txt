@@ -1,0 +1,26 @@
+# ---- 运行必需 ----------------------------------------------------------
+# Windows 上 zoneinfo 找不到系统时区数据库, 必须装 tzdata,
+# 否则跨时区/夏令时计算会直接抛 ZoneInfoNotFoundError。
+tzdata>=2024.1
+
+# ---- 界面必需 ----------------------------------------------------------
+PySide6>=6.6            # 便签悬浮窗 / 托盘 / 翻页动画 (6.11 已支持 Python 3.14)
+
+# ---- 按需安装 (装了就自动启用, 没装会降级) ------------------------------
+pillow>=10.0            # OCR 预处理: 放大/灰度/自动对比度
+mss>=9.0                # 跨屏截图 (否则退回 Qt 截屏 —— Qt6/Windows 上常抓不到图, 会变成黑窗口)
+rapidocr-onnxruntime>=1.3   # 离线 OCR 首选: 中英文印刷体, 无 torch, 不做网络请求
+# Windows 自带 OCR (不需要模型, 包小、快): Python 3.12 及以下用 winsdk;
+# 3.13/3.14 上 winsdk 编不出 wheel (实测失败), 改用新式 winrt-* 投影包 (一堆独立分发)。
+winsdk>=1.0 ; python_version < "3.13"
+winrt-runtime>=3.2 ; python_version >= "3.13"
+winrt-Windows.Media.Ocr>=3.2 ; python_version >= "3.13"
+winrt-Windows.Graphics.Imaging>=3.2 ; python_version >= "3.13"
+winrt-Windows.Storage.Streams>=3.2 ; python_version >= "3.13"
+winrt-Windows.Globalization>=3.2 ; python_version >= "3.13"
+winrt-Windows.Foundation>=3.2 ; python_version >= "3.13"
+winrt-Windows.Foundation.Collections>=3.2 ; python_version >= "3.13"
+win11toast>=0.35        # 可选: 带按钮的 Windows 通知
+
+# ---- 开发 --------------------------------------------------------------
+pytest>=8.0

@@ -1,0 +1,20 @@
+# 构建产物 (由 packaging/build.py 生成, 不入库)
+build/
+dist/
+packaging/out/
+packaging/version_info.txt
+packaging/assets/icon*.png
+packaging/assets/icon.ico
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 用户数据 (默认不在仓库里, 仅防误提交)
+*.db
+*.db-wal
+*.db-shm
+logs/
