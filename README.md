@@ -104,7 +104,10 @@ python packaging/build.py --check-only   # 结构校验（不生成产物）
 打包前请确认以下事项：
 
 1. **代码签名证书**。Windows 11 的 Smart App Control 处于强制状态时，未签名的 exe 可能被系统拦截（`WinError 4551`）。是否拦截取决于文件信誉与策略生效状态，换一台机器可能不同。签名是分发的前提而不是优化项。
-2. **内置手写字体**。把 `LXGWWenKai-Bold.ttf` 放进 `reminder_assistant/assets/fonts/`（见该目录 `README.txt`）。不放会退到系统楷体，PRD 4.1 的「100% 清晰可辨认」无从保证。
+2. ~~**内置手写字体**~~ 已内置：`reminder_assistant/assets/fonts/LXGWWenKai-Medium.ttf`
+   （霞鹜文楷 v1.530，SIL OFL 1.1，20,992 基本区汉字，对常用字库 100% 覆盖；许可全文见同目录
+   `OFL-LXGWWenKai.txt`）。上游 v1.530 没有 Bold，用 Medium + Qt 合成加粗。
+   验证过程见 `docs/外部输入-vetting报告.md`。
 
 ## 说明
 
