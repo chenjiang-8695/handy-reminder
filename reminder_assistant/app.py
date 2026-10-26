@@ -819,6 +819,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sync-listen", type=int, metavar="端口", default=None,
                    help="设备间同步: 监听端口等对端来同步 (Ctrl+C 退出), 例如 --sync-listen 8767")
     p.add_argument("--sync-name", default=None, help="设备名 (显示在对端), 默认用主机名")
+    p.add_argument("--sync-scan", nargs="?", type=float, const=5.0, default=None, metavar="秒",
+                   help="局域网里找一找有哪些设备在等同步 (默认找 5 秒)")
     p.add_argument("--page-port", type=int, default=8766, help="手机端网页端口")
     p.add_argument("--no-toast", action="store_true", help="不用系统通知, 只在控制台输出")
     p.add_argument("--hotkey", default=None, help="覆盖设置里的全局快捷键, 如 alt+q")
@@ -875,30 +877,55 @@ def main(argv: list[str] | None = None) -> int:
         app.close()
         return 0
 
-    if args.peer or args.sync_listen:
+    if args.peer or args.sync_listen or args.sync_scan is not None:
+        from .sync_discovery import Discovery
         from .sync_link import SyncError, SyncServer, sync_once
 
+        name = args.sync_name or ""
         try:
+            if args.sync_scan is not None:
+                with Discovery(app.store, 0, name=name) as disc:
+                    found = disc.scan(float(args.sync_scan))
+                if not found:
+                    print("没发现对端: 两端要在同一 WiFi, 而且对端得用 --sync-listen 开着")
+                    return 1
+                for p in found:
+                    print(f"  {p['name']}  {p['host']}:{p['sync_port']}  ({p['device_id'][:8]})")
+                return 0
+
             if args.peer:
-                host, _, port = args.peer.rpartition(":")
-                if not host or not port.isdigit():
-                    print("--peer 要写成 HOST:PORT, 例如 192.168.1.7:8767")
-                    return 2
-                result = sync_once(app.store, host, int(port), name=args.sync_name or "")
+                target = args.peer.strip()
+                if target.lower() == "auto":
+                    with Discovery(app.store, 0, name=name) as disc:
+                        found = disc.scan(6.0)
+                    if not found:
+                        print("没自动发现对端: 要么同一 WiFi 没别人在监听, 要么改用 --peer HOST:PORT")
+                        return 1
+                    host, port = found[0]["host"], found[0]["sync_port"]
+                    print(f"发现对端: {found[0]['name']} ({host}:{port})")
+                else:
+                    host, _, port = target.rpartition(":")
+                    if not host or not port.isdigit():
+                        print("--peer 要写成 HOST:PORT 或 auto, 例如 192.168.1.7:8767")
+                        return 2
+                result = sync_once(app.store, host, int(port), name=name)
                 print(f"对端 {result['peer_name']} ({result['peer'][:8]})  拉到 {result['pulled']} 条,"
                       f" 推过去 {result['pushed']} 条")
                 print(f"  本端应用: {result['apply']}")
                 print(f"  对端应用: {result['peer_apply']}")
                 return 0
-            server = SyncServer(app.store, host="0.0.0.0", port=args.sync_listen,
-                                name=args.sync_name or "")
-            print(f"同步监听中: {server.host}:{server.port}  (Ctrl+C 退出)")
+
+            server = SyncServer(app.store, host="0.0.0.0", port=args.sync_listen, name=name)
+            disc = Discovery(app.store, server.port, name=name).start()
+            print(f"同步监听中: 端口 {server.port}  自动发现: UDP {disc.port}  (Ctrl+C 退出)")
             server.start()
             try:
                 while True:
                     time.sleep(0.5)
             except KeyboardInterrupt:
                 server.stop()
+            finally:
+                disc.stop()
             return 0
         except (OSError, SyncError) as exc:
             print(f"同步失败: {exc}")
