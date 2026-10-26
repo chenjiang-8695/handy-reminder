@@ -8,6 +8,9 @@
 * 通知去重        -> fired_log / notifications 两把主键锁, INSERT OR IGNORE 天然幂等
 * 多实例冲突      -> 数据目录独占锁 (msvcrt/fcntl), 第二个实例拿到 StoreLocked
 * 存储失败降级    -> 写入异常抛出 StoreError, 由上层降级为内存模式并提示用户
+* 跨端同步待发箱  -> 每次业务改动在**同一事务**里追加一条 outbox 行 (阶段一: 只写不发);
+                     阶段二起对端操作走 apply_remote_op(), 不再回声进待发箱;
+                     崩溃后 inflight 退回 pending; 重放幂等靠 op_id, 不靠自增 id
 * 最小权限/隐私   -> 只落本地文件; 内容默认不加密但预留 cipher 钩子 (见 docs)
 """
 
@@ -40,7 +43,7 @@ def _d(v: str | None) -> datetime | None:
     return datetime.fromisoformat(v) if v else None
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # reminders 的同步列 (列名, 建列声明) —— **唯一定义**。
 # 新建库走下面的 SCHEMA, 老库走 _add_missing_columns() 的 ALTER;
@@ -127,7 +130,7 @@ CREATE TABLE IF NOT EXISTS outbox(
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   op_id        TEXT    NOT NULL UNIQUE,        -- 幂等键, 重放一百次只生效一次
   uuid         TEXT    NOT NULL,               -- 目标提醒
-  op_type      TEXT    NOT NULL,               -- create|update|complete|uncomplete|delete|move|replan|expire_batch
+  op_type      TEXT    NOT NULL,               -- create|update|complete|delete|replan|expire
   payload      TEXT    NOT NULL DEFAULT '{}',
   base_version INTEGER NOT NULL DEFAULT 0,     -- 产生该操作时本端的版本号
   created_at   TEXT    NOT NULL,
@@ -137,6 +140,13 @@ CREATE TABLE IF NOT EXISTS outbox(
   depend_on    TEXT                            -- 同批次的前序 op_id (向导批量创建)
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_state ON outbox(state, id);
+
+-- 已应用过的对端操作 (幂等水位): 三端转发时同一条操作会从不同对端到达, 靠它收敛
+CREATE TABLE IF NOT EXISTS applied_ops(
+  op_id      TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL,
+  peer       TEXT NOT NULL DEFAULT ''
+);
 
 -- 向导式创建的草稿: 中途 Esc 不丢已填内容 (PRD 2.5)
 CREATE TABLE IF NOT EXISTS draft(
@@ -265,6 +275,11 @@ class Store:
                     "INSERT INTO occurrences(reminder_id, idx, gen, fire_at, state)"
                     " VALUES(?,?,?,?, 'pending')",
                     (rem.id, i, occ.gen, _s(occ.fire_at)))
+            # 建卡即入待发箱: uuid 是客户端生成的, 所以断网也能建
+            self.conn.execute(
+                "UPDATE reminders SET version=1, dirty=1, sync_state='dirty' WHERE id=?", (rem.id,))
+            rem.version, rem.dirty, rem.sync_state = 1, 1, "dirty"
+            self._record_op(rem.uuid, "create", self._snapshot(rem))
         return rem
 
     def get_reminder(self, rid: int) -> Reminder | None:
@@ -310,7 +325,15 @@ class Store:
             vals.append(_s(v) if isinstance(v, datetime) else v)
         vals.append(rid)
         with self._lock, self.conn:
+            row0 = self.conn.execute(
+                "SELECT uuid, version FROM reminders WHERE id=?", (rid,)).fetchone()
             cur = self.conn.execute(f"UPDATE reminders SET {', '.join(cols)} WHERE id=?", vals)
+            if cur.rowcount and row0:
+                payload = {"fields": {k: (_s(v) if isinstance(v, datetime) else v)
+                                      for k, v in fields.items()},
+                           "version": self._bump_version(rid)}
+                self._record_op(row0["uuid"], "update", payload,
+                                base_version=int(row0["version"]))
         return cur.rowcount > 0
 
     # ------------------------------------------------------------ 二级目录 (2.5)
@@ -408,13 +431,28 @@ class Store:
 
     def update_title(self, rid: int, title: str) -> None:
         with self._lock, self.conn:
-            self.conn.execute("UPDATE reminders SET title=? WHERE id=?", (title, rid))
+            row0 = self.conn.execute(
+                "SELECT uuid, version FROM reminders WHERE id=?", (rid,)).fetchone()
+            cur = self.conn.execute("UPDATE reminders SET title=? WHERE id=?", (title, rid))
+            if cur.rowcount and row0:
+                self._record_op(row0["uuid"], "update",
+                                {"fields": {"title": title},
+                                 "version": self._bump_version(rid)},
+                                base_version=int(row0["version"]))
 
     def delete_reminder(self, rid: int) -> int:
         """物理删除 (级联删触发点)。"划掉"是 complete, 这个才是真删 ——
-        数据模型里 completed 和 deleted 是两个语义 (见设计文档 9.2)。"""
+        数据模型里 completed 和 deleted 是两个语义 (见设计文档 9.2)。
+
+        删除必须留墓碑: 行没了, 但待发箱里留下完整快照。否则对端只看到"某条不见了",
+        分不清是删除、还是自己漏收了 —— 于是它会把旧的那条再推回来, 幽灵提醒复活。
+        """
         with self._lock, self.conn:
+            rem = self.get_reminder(rid)
             cur = self.conn.execute("DELETE FROM reminders WHERE id=?", (rid,))
+            if cur.rowcount and rem:
+                self._record_op(rem.uuid, "delete", self._snapshot(rem),
+                                base_version=int(rem.version))
         return cur.rowcount
 
     def id_of_uuid(self, uuid_: str) -> int | None:
@@ -422,6 +460,260 @@ class Store:
         with self._lock:
             row = self.conn.execute("SELECT id FROM reminders WHERE uuid=?", (uuid_,)).fetchone()
         return int(row["id"]) if row else None
+
+    # ------------------------------------------------------------ 待发箱 (跨端同步, 阶段一)
+    def _snapshot(self, rem: Reminder) -> dict:
+        """一条提醒的完整同步载荷。不含本地自增 id —— 设备之间只认 uuid。"""
+        return {
+            "uuid": rem.uuid, "title": rem.title, "source_text": rem.source_text,
+            "event_at": _s(rem.event_at), "tz": rem.tz, "level": rem.level,
+            "plan": rem.plan.to_json(), "status": rem.status,
+            "created_at": _s(rem.created_at), "completed_at": _s(rem.completed_at),
+            "expire_at": _s(rem.expire_at),
+            "bbox": list(rem.bbox) if rem.bbox else None, "note": rem.note,
+            "parent_uuid": rem.parent_uuid, "depth": int(rem.depth),
+            "sort_key": float(rem.sort_key), "batch_id": rem.batch_id,
+            "duration_min": int(rem.duration_min),
+        }
+
+    def _record_op(self, uuid_: str, op_type: str, payload: dict | None = None,
+                   base_version: int = 0, depend_on: str | None = None) -> str:
+        """把一次业务改动写进 outbox, 返回 op_id。
+
+        **必须在业务写入的同一个事务里调用** —— 待发行和业务行要么一起提交、要么一起回滚。
+        分开提交就会出现"界面上删了, 待发箱里却没有这次删除": 对端永远收不到,
+        用户以为删了、手机还在提醒。这正是设计文档里排第一的那类丢操作。
+        """
+        op_id = new_uuid()
+        self.conn.execute(
+            "INSERT INTO outbox(op_id, uuid, op_type, payload, base_version, created_at, depend_on)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (op_id, uuid_, op_type, json.dumps(payload or {}, ensure_ascii=False),
+             int(base_version), _s(datetime.now()), depend_on))
+        return op_id
+
+    def _bump_version(self, rid: int) -> int:
+        """本地改动一律 version+1 并打脏标; 返回新版本号 (写进 payload 供对端对账)。"""
+        self.conn.execute(
+            "UPDATE reminders SET version=version+1, dirty=1, sync_state='dirty' WHERE id=?", (rid,))
+        row = self.conn.execute("SELECT version FROM reminders WHERE id=?", (rid,)).fetchone()
+        return int(row["version"]) if row else 0
+
+    def outbox_pending(self, limit: int = 200) -> list[dict]:
+        """按写入顺序取待发操作 (阶段二由同步线程消费, 顺序即因果顺序)。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM outbox WHERE state='pending' ORDER BY id LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def outbox_all(self, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM outbox ORDER BY id LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def outbox_count(self, state: str | None = None) -> int:
+        with self._lock:
+            if state:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) c FROM outbox WHERE state=?", (state,)).fetchone()
+            else:
+                row = self.conn.execute("SELECT COUNT(*) c FROM outbox").fetchone()
+        return int(row["c"]) if row else 0
+
+    def outbox_mark(self, op_id: str, state: str, error: str | None = None) -> bool:
+        """标记投递状态: inflight(已发出未确认) / acked(对端确认) / dead(重试耗尽)。"""
+        if state not in ("pending", "inflight", "acked", "dead"):
+            raise StoreError(f"未知的 outbox 状态: {state}")
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE outbox SET state=?, attempts=attempts+1, last_error=? WHERE op_id=?",
+                (state, error, op_id))
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------ 应用对端操作 (阶段二)
+    def device_id(self) -> str:
+        """本机身份号 (首次调用时生成, 之后一直不变)。冲突打平与配对都靠它。"""
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT v FROM meta WHERE k='sync.device_id'").fetchone()
+            if row and row["v"]:
+                return str(row["v"])
+            did = new_uuid()
+            self.conn.execute(
+                "INSERT INTO meta(k,v) VALUES('sync.device_id',?)"
+                " ON CONFLICT(k) DO UPDATE SET v=excluded.v", (did,))
+            return did
+
+    def applied(self, op_id: str) -> bool:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT 1 FROM applied_ops WHERE op_id=?", (op_id,)).fetchone() is not None
+
+    def _mark_applied(self, op_id: str, peer: str = "") -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO applied_ops(op_id, applied_at, peer) VALUES(?,?,?)",
+            (op_id, _s(datetime.now()), peer))
+
+    def outbox_after(self, cursor: int = 0, limit: int = 500) -> list[dict]:
+        """取游标之后的操作。游标就是对端最后应用的那条 outbox.id (库内自增, 顺序即因果顺序)。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM outbox WHERE id > ? ORDER BY id LIMIT ?",
+                (int(cursor), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    def cursor_of(self, peer: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT v FROM meta WHERE k=?", (f"sync.cursor.{peer}",)).fetchone()
+        return int(row["v"]) if row and row["v"] else 0
+
+    def set_cursor(self, peer: str, value: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (f"sync.cursor.{peer}", str(int(value))))
+
+    @staticmethod
+    def _snapshot_to_reminder(snap: dict) -> Reminder:
+        bbox = snap.get("bbox")
+        return Reminder(
+            title=snap.get("title") or "", source_text=snap.get("source_text") or "",
+            event_at=_d(snap.get("event_at")), tz=snap.get("tz") or "",
+            level=snap.get("level") or "日常",
+            plan=ReminderPlan.from_json(snap.get("plan") or "[]"),
+            status=snap.get("status") or "active",
+            created_at=_d(snap.get("created_at")) or datetime.now(),
+            completed_at=_d(snap.get("completed_at")), expire_at=_d(snap.get("expire_at")),
+            bbox=tuple(bbox) if bbox else None, note=snap.get("note") or "",
+            uuid=snap.get("uuid") or "", parent_uuid=snap.get("parent_uuid") or "",
+            depth=int(snap.get("depth") or 0), sort_key=float(snap.get("sort_key") or 0.0),
+            batch_id=snap.get("batch_id") or "",
+            duration_min=int(snap.get("duration_min") or 0))
+
+    def _insert_snapshot(self, snap: dict, version: int) -> int:
+        rem = self._snapshot_to_reminder(snap)
+        rem.uuid = rem.uuid or new_uuid()
+        cur = self.conn.execute(
+            "INSERT INTO reminders(title, source_text, event_at, tz, level, plan, status,"
+            " created_at, completed_at, expire_at, bbox, note, uuid, parent_uuid, depth,"
+            " sort_key, batch_id, duration_min, version, dirty, sync_state)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'clean')",
+            (rem.title, rem.source_text, _s(rem.event_at), rem.tz, rem.level,
+             rem.plan.to_json(), rem.status, _s(rem.created_at), _s(rem.completed_at),
+             _s(rem.expire_at), json.dumps(rem.bbox) if rem.bbox else None, rem.note,
+             rem.uuid, rem.parent_uuid, int(rem.depth), float(rem.sort_key), rem.batch_id,
+             int(rem.duration_min), int(version)))
+        rid = int(cur.lastrowid)
+        rem.id = rid            # occurrences() 要求已持久化 (没有 id 就不肯展开)
+        for i, occ in enumerate(rem.occurrences()):
+            self.conn.execute(
+                "INSERT INTO occurrences(reminder_id, idx, gen, fire_at, state)"
+                " VALUES(?,?,?,?,'pending')", (rid, i, occ.gen, _s(occ.fire_at)))
+        return rid
+
+    def apply_remote_op(self, op: dict, peer: str = "") -> str:
+        """应用一条对端操作, 返回 applied / duplicate / orphan / rejected。
+
+        与本地写入的关键区别: **不产生新的待发行**。否则两端会互相回声,
+        一条改动在两台机器之间永远同步不完。落库的同时记 applied_ops 作为幂等水位。
+
+        冲突判定 (设计文档 §7): version 大者胜 → 相等时 origin device_id 大者胜;
+        删除在 version 不小于本地时一律生效 (不让旧的 update 把删掉的条目救活)。
+        """
+        op_id = str(op.get("op_id") or "")
+        if not op_id:
+            raise StoreError("远端操作缺少 op_id")
+        uuid_ = str(op.get("uuid") or "")
+        op_type = str(op.get("op_type") or "")
+        payload = op.get("payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload or "{}")
+        version = int(payload.get("version") or op.get("base_version") or 0)
+        mine = self.device_id()
+        origin = str(op.get("origin") or peer or "")
+
+        with self._lock, self.conn:
+            if self.conn.execute("SELECT 1 FROM applied_ops WHERE op_id=?", (op_id,)).fetchone():
+                return "duplicate"
+            row = self.conn.execute("SELECT * FROM reminders WHERE uuid=?", (uuid_,)).fetchone()
+
+            if op_type == "create":
+                if row is None:
+                    self._insert_snapshot(payload, version or 1)
+                    self._mark_applied(op_id, peer)
+                    return "applied"
+                # 两端同时建了同一条 (同一 uuid): 退化成版本比较
+            elif row is None:
+                # 没见过这条: 记为 orphan —— 通常是本端漏收了 create。
+                # 记 applied 免得每次都重放同一堆孤儿, 真正的修复靠阶段二的全量对比。
+                self._mark_applied(op_id, peer)
+                return "orphan"
+
+            local_version = int(row["version"])
+            if op_type == "delete":
+                # 删除无条件优先: 只要对端删了, 本端就跟着删。
+                # 用版本比较会留下"删完又被一条旧 update 救活"的经典幽灵提醒。
+                accept = True
+            else:
+                accept = version > local_version or (
+                    version == local_version and origin > mine)
+            if not accept:
+                self._mark_applied(op_id, peer)
+                return "rejected"
+
+            if op_type in ("update", "create"):
+                fields = payload.get("fields") or payload
+                cols, vals = [], []
+                for k, v in (fields or {}).items():
+                    if k not in ATTRIBUTE_FIELDS:
+                        continue
+                    cols.append(f"{k}=?")
+                    vals.append(_s(datetime.fromisoformat(v))
+                                if k in ("event_at", "expire_at") and isinstance(v, str) else v)
+                if cols:
+                    cols.append("version=?")
+                    vals.append(version)
+                    vals.append(row["id"])
+                    self.conn.execute(
+                        f"UPDATE reminders SET {', '.join(cols)}, dirty=0, sync_state='clean'"
+                        f" WHERE id=?", vals)
+            elif op_type == "complete":
+                self.conn.execute(
+                    "UPDATE reminders SET status='completed', completed_at=?, version=?,"
+                    " dirty=0, sync_state='clean' WHERE id=?",
+                    (payload.get("completed_at") or _s(datetime.now()), version, row["id"]))
+                self.conn.execute(
+                    "UPDATE occurrences SET state='cancelled'"
+                    " WHERE reminder_id=? AND state IN ('pending','firing')", (row["id"],))
+            elif op_type == "expire":
+                self.conn.execute(
+                    "UPDATE reminders SET status='expired', completed_at=?, version=?,"
+                    " dirty=0, sync_state='clean' WHERE id=?",
+                    (payload.get("completed_at") or _s(datetime.now()), version, row["id"]))
+                self.conn.execute(
+                    "UPDATE occurrences SET state='cancelled'"
+                    " WHERE reminder_id=? AND state IN ('pending','firing')", (row["id"],))
+            elif op_type == "replan":
+                rem = self.get_reminder(int(row["id"]))
+                plan = ReminderPlan.from_json(payload.get("plan") or "[]")
+                self.conn.execute("UPDATE reminders SET plan=?, version=?, dirty=0,"
+                                  " sync_state='clean' WHERE id=?",
+                                  (plan.to_json(), version, row["id"]))
+                self.conn.execute("DELETE FROM occurrences WHERE reminder_id=?", (row["id"],))
+                if rem is not None and rem.event_at is not None:
+                    base = int(row["id"])  # 代际号只需在本机单调, 用 id 起算足够
+                    for i, off in enumerate(plan.offsets):
+                        self.conn.execute(
+                            "INSERT INTO occurrences(reminder_id, idx, gen, fire_at, state)"
+                            " VALUES(?,?,?,?,'pending')",
+                            (row["id"], i, base + version, _s(rem.event_at + off)))
+            elif op_type == "delete":
+                self.conn.execute("DELETE FROM reminders WHERE id=?", (row["id"],))
+            else:
+                raise StoreError(f"未知的远端操作类型: {op_type}")
+
+            self._mark_applied(op_id, peer)
+            return "applied"
 
     # ------------------------------------------------------------ 触发点
     def pending_occurrences(self, only_active: bool = True) -> list[Occurrence]:
@@ -510,6 +802,10 @@ class Store:
                     "INSERT INTO occurrences(reminder_id, idx, gen, fire_at, state)"
                     " VALUES(?,?,?,?, 'pending')", (rid, i, base, _s(rem.event_at + off)))
             self.conn.execute("UPDATE reminders SET plan=? WHERE id=?", (plan.to_json(), rid))
+            self._record_op(rem.uuid, "replan",
+                            {"plan": plan.to_json(), "gen": base,
+                             "version": self._bump_version(rid)},
+                            base_version=int(rem.version))
         return base
 
     def cancel_pending(self, rid: int) -> int:
@@ -543,12 +839,19 @@ class Store:
         """用户"划掉/完成": 立刻终止未来所有触发点。"""
         when = when or datetime.now()
         with self._lock, self.conn:
+            row0 = self.conn.execute(
+                "SELECT uuid, version FROM reminders WHERE id=?", (rid,)).fetchone()
             self.conn.execute(
                 "UPDATE reminders SET status='completed', completed_at=? WHERE id=? AND status='active'",
                 (_s(when), rid))
             cur = self.conn.execute(
                 "UPDATE occurrences SET state='cancelled'"
                 " WHERE reminder_id=? AND state IN ('pending','firing')", (rid,))
+            if cur.rowcount and row0:
+                self._record_op(row0["uuid"], "complete",
+                                {"completed_at": _s(when),
+                                 "version": self._bump_version(rid)},
+                                base_version=int(row0["version"]))
         return cur.rowcount
 
     def expire_due(self, now: datetime, grace: timedelta = timedelta(0)) -> list[int]:
@@ -560,11 +863,18 @@ class Store:
                 " AND expire_at <= ?", (cutoff,)).fetchall()
             ids = [r["id"] for r in rows]
             for rid in ids:
+                row0 = self.conn.execute(
+                    "SELECT uuid, version FROM reminders WHERE id=?", (rid,)).fetchone()
                 self.conn.execute(
                     "UPDATE reminders SET status='expired', completed_at=? WHERE id=?", (_s(now), rid))
                 self.conn.execute(
                     "UPDATE occurrences SET state='cancelled'"
                     " WHERE reminder_id=? AND state IN ('pending','firing')", (rid,))
+                if row0:
+                    self._record_op(row0["uuid"], "expire",
+                                    {"completed_at": _s(now),
+                                     "version": self._bump_version(rid)},
+                                    base_version=int(row0["version"]))
         return ids
 
     def prune(self, older_than: timedelta = timedelta(days=30), now: datetime | None = None) -> int:
@@ -575,14 +885,27 @@ class Store:
             cur = self.conn.execute(
                 "DELETE FROM reminders WHERE status<>'active' AND completed_at IS NOT NULL"
                 " AND completed_at < ?", (cutoff,))
-        return cur.rowcount
+            n = cur.rowcount
+            # 只有已确认的待发行算垃圾; pending/inflight/dead 一律留着 (dead 要能被诊断)
+            self.conn.execute(
+                "DELETE FROM outbox WHERE state='acked' AND created_at < ?", (cutoff,))
+            # 幂等水位也要过期: 留 30 天足够覆盖任何合理的断网时长
+            self.conn.execute(
+                "DELETE FROM applied_ops WHERE applied_at < ?", (cutoff,))
+        return n
 
     def recover_inflight(self) -> int:
-        """崩溃恢复: 上次进程死在"已出队/未确认"状态的触发点退回 pending。"""
+        """崩溃恢复: 上次进程死在"已出队/未确认"的触发点与待发行退回 pending。
+
+        待发行也必须退回: 它可能已经发出去了, 但对端还没确认就断电了。
+        退回后重放一次, 靠 op_id 幂等, 不会在手机上变成两条。
+        """
         with self._lock, self.conn:
             cur = self.conn.execute(
                 "UPDATE occurrences SET state='pending' WHERE state='firing'")
-        return cur.rowcount
+            undone = self.conn.execute(
+                "UPDATE outbox SET state='pending' WHERE state='inflight'").rowcount
+        return cur.rowcount + undone
 
     def stats(self) -> dict:
         with self._lock:

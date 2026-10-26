@@ -11,6 +11,10 @@ python -m reminder_assistant --selftest          # 端到端时间线自检
 python -m reminder_assistant --serve             # 常驻: 便签悬浮窗 + Alt+Q 圈选
 python -m reminder_assistant --autostart on      # 开机自启
 python -m reminder_assistant --autostart status  # 查看自启状态
+
+# 设备间同步 (阶段二: 同一局域网, 手工指定对端; 无服务器, 数据不中转)
+python -m reminder_assistant --sync-listen 8767  # 本机监听, 等对端来同步
+python -m reminder_assistant --peer 192.168.1.7:8767   # 主动连对端同步一次
 ```
 
 **便签怎么用**：纸头右上角四个小按钮 —— ＋ 添加（在下面的输入行写一句
@@ -28,7 +32,7 @@ python -m reminder_assistant --autostart status  # 查看自启状态
 reminder_assistant/
   timeparse.py   中文自然语言时间解析（零依赖、歧义显式化、时区安全）
   scheduler.py   最小堆调度器（休眠补发 / 改时间纠正 / 幂等去重 / 改期不新建）
-  store.py       SQLite WAL 持久化（崩溃恢复 / 多实例锁 / 通知去重）
+  store.py       SQLite WAL 持久化（崩溃恢复 / 多实例锁 / 通知去重 / 待发箱 outbox 与墓碑）
   lifecycle.py   完成 → 立即销毁；过期 → 静默清理；历史归档
   notify.py      通知投递（分级 / 免打扰合并 / 三级降级链）
   ocr.py         圈选截图 + 多引擎 OCR 融合 + 准确率量化
@@ -40,10 +44,11 @@ reminder_assistant/
   autostart.py   开机自启（注册表 Run 键 + 写完读回校验）
   settings.py    用户设置（等级配方/自定义/免打扰/热键，落 meta 表）
   ui/settings_dialog.py  设置面板 + 单条提醒的「高级事件」频率面板（含实时预览、组合键格式实时校验）
+  sync_link.py   设备间同步线缆层（TCP + 长度前缀帧; 先拉后推; 冲突判定在 store）
   resources.py   打包后资源定位（_MEIPASS）
   winconsole.py  窗口化构建下附着父控制台 + 标准输出统一 UTF-8，一个 exe 兼当 CLI
 packaging/       PyInstaller spec（含瘦身过滤）/ 图标与版本信息生成器 / 构建与校验脚本
-tests/           12 个自动化测试文件（见下文测试章节）
+tests/           14 个自动化测试文件（见下文测试章节）
 ```
 
 ## 测试
@@ -52,7 +57,7 @@ tests/           12 个自动化测试文件（见下文测试章节）
 python -m pytest tests -q
 ```
 
-当前仓库包含 **12 个测试文件**：
+当前仓库包含 **14 个测试文件**（288 通过 / 30 跳过；UI/环境相关用例会自动跳过）：
 
 | 测试文件 | 说明 |
 |---|---|
@@ -68,6 +73,8 @@ python -m pytest tests -q
 | `test_integration.py` | 集成测试 |
 | `test_ui_smoke.py` | UI 冒烟 |
 | `test_migration.py` | 数据迁移 |
+| `test_outbox.py` | 跨端待发箱（每次操作恰一条 / 墓碑 / 重启不丢） |
+| `test_sync_link.py` | 设备间同步（真 TCP 双实例 / 冲突 / 删除优先） |
 
 ## 打包
 
@@ -83,5 +90,5 @@ python packaging/build.py --check-only   # 结构校验（不生成产物）
 ## 说明
 
 - 本仓库为开源基础版，仅保留可运行、可测试的代码与测试。
-- 内部文档（交接说明、云端同步设计、答疑、阶段一计划、技术介绍、演示脚本、架构选型、方案）已移除，若需查看请联系原始作者。
+- `docs/` 里有：交接说明、同步方案-B版（本方案）、云端同步与数据模型设计（旧版，云端事实源）、阶段一实施计划、总体方案、技术介绍、演示脚本、答疑两篇、识别抗干扰方案、免安装版使用说明。
 - 测试数据、报告截图、客户需求、测试反馈等已移出仓库，请从原工作目录获取。

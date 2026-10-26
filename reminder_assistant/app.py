@@ -12,6 +12,7 @@ import argparse
 import ctypes
 import logging
 import sys
+import time
 from datetime import datetime, timedelta
 
 from .account import AccountBook
@@ -813,6 +814,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--demo-sync", action="store_true",
                    help="展示版: 开一个局域网同步桥, 手机浏览器打开网址即可当手机端 (演示用回环)")
     p.add_argument("--sync-port", type=int, default=8765, help="同步桥 WebSocket 端口")
+    p.add_argument("--peer", metavar="HOST:PORT",
+                   help="设备间同步: 连到对端同步一次, 例如 --peer 192.168.1.7:8767")
+    p.add_argument("--sync-listen", type=int, metavar="端口", default=None,
+                   help="设备间同步: 监听端口等对端来同步 (Ctrl+C 退出), 例如 --sync-listen 8767")
+    p.add_argument("--sync-name", default=None, help="设备名 (显示在对端), 默认用主机名")
     p.add_argument("--page-port", type=int, default=8766, help="手机端网页端口")
     p.add_argument("--no-toast", action="store_true", help="不用系统通知, 只在控制台输出")
     p.add_argument("--hotkey", default=None, help="覆盖设置里的全局快捷键, 如 alt+q")
@@ -868,6 +874,37 @@ def main(argv: list[str] | None = None) -> int:
         _print_board(app)
         app.close()
         return 0
+
+    if args.peer or args.sync_listen:
+        from .sync_link import SyncError, SyncServer, sync_once
+
+        try:
+            if args.peer:
+                host, _, port = args.peer.rpartition(":")
+                if not host or not port.isdigit():
+                    print("--peer 要写成 HOST:PORT, 例如 192.168.1.7:8767")
+                    return 2
+                result = sync_once(app.store, host, int(port), name=args.sync_name or "")
+                print(f"对端 {result['peer_name']} ({result['peer'][:8]})  拉到 {result['pulled']} 条,"
+                      f" 推过去 {result['pushed']} 条")
+                print(f"  本端应用: {result['apply']}")
+                print(f"  对端应用: {result['peer_apply']}")
+                return 0
+            server = SyncServer(app.store, host="0.0.0.0", port=args.sync_listen,
+                                name=args.sync_name or "")
+            print(f"同步监听中: {server.host}:{server.port}  (Ctrl+C 退出)")
+            server.start()
+            try:
+                while True:
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                server.stop()
+            return 0
+        except (OSError, SyncError) as exc:
+            print(f"同步失败: {exc}")
+            return 1
+        finally:
+            app.close()
 
     if args.account:
         try:
