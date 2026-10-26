@@ -54,23 +54,27 @@ def collect(root: pathlib.Path, sub: str = "global_canvas") -> list[tuple[bytes,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("root", help="生成器的输出目录 (含 global_canvas/)")
+    ap.add_argument("roots", nargs="+", help="一个或多个生成器输出目录 (含 global_canvas/)")
     ap.add_argument("--sub", default="global_canvas", help="子目录: global_canvas 或 rectified_lines")
     ap.add_argument("--show", type=int, default=0, help="打印前 N 张的真值/识别对比")
     args = ap.parse_args()
 
-    root = pathlib.Path(args.root)
-    samples = collect(root, args.sub)
-    if not samples:
-        print(f"没找到样本: {root}")
-        return 2
+    samples: list[tuple[bytes, str]] = []
+    for raw_root in args.roots:
+        root = pathlib.Path(raw_root)
+        part = collect(root, args.sub)
+        if not part:
+            print(f"没找到样本: {root}")
+            return 2
+        print(f"{root.name}: {len(part)} 张")
+        samples.extend(part)
 
     engines = ocr.default_engines()
     if not engines:
         print("没有可用的 OCR 后端")
         return 3
     engine = engines[0]
-    print(f"引擎: {type(engine).__name__} | 样本: {len(samples)} 张 | 目录: {root}")
+    print(f"引擎: {type(engine).__name__} | 合计 {len(samples)} 张")
 
     for png, truth in samples[: args.show]:
         got = engine.recognize(ocr.preprocess(png))
