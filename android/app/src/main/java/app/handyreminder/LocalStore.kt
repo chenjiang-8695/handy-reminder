@@ -145,18 +145,17 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB
         }
 
     // ------------------------------------------------------------ 本地写入 (手机自己改)
-    fun addReminder(title: String, eventAt: Instant, level: String = "日常", plan: List<Long> = listOf(0L)): String {
+    fun addReminder(
+        title: String,
+        eventAt: Instant,
+        level: String = "日常",
+        plan: List<Long> = listOf(0L),
+    ): String {
         val uuid = UUID.randomUUID().toString()
         val now = Instant.now().toString()
-        val payload = JSONObject()
-            .put("uuid", uuid).put("title", title)
-            .put("event_at", eventAt.toString())
-            .put("tz", ZoneId.systemDefault().id)
-            .put("level", level).put("plan", JSONArray(plan).toString())
-            .put("status", "active").put("created_at", now)
-            .put("version", 1)
-            .put("parent_uuid", "").put("depth", 0).put("sort_key", 0.0)
-            .put("batch_id", "").put("duration_min", 0); Unit
+        val tz = ZoneId.systemDefault().id
+        // 载荷交给 Payloads 构造 (纯 JVM 有测试钉字段名); 这里只负责落库 + 记待发
+        val payload = Payloads.create(uuid, title, eventAt.toString(), tz, level, plan, now)
         val db = writableDb
         db.beginTransaction()
         try {
@@ -188,8 +187,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB
                 "UPDATE reminders SET status='completed', completed_at=?, version=version+1, dirty=1, sync_state='dirty' WHERE uuid=?",
                 arrayOf(now, uuid)
             )
-            val payload = JSONObject().put("completed_at", now).put("version", version + 1)
-            recordOp(db, uuid, "complete", payload, version)
+            recordOp(db, uuid, "complete", Payloads.complete(now, version + 1), version)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()

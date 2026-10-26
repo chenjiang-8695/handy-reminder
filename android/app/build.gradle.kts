@@ -11,8 +11,8 @@ android {
         applicationId = "app.handyreminder"
         minSdk = 26            // AlarmManager 精确闹钟的起点; 26 以下要另写兼容分支, 先不铺
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
 
     buildTypes {

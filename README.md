@@ -91,7 +91,8 @@ python -m pytest tests -q
 
 ## 安卓端
 
-`android/` 是一个独立的 Gradle 工程（Kotlin，minSdk 26，targetSdk 34）：局域网发现 → 同步 → 到点本地通知。
+`android/` 是一个独立的 Gradle 工程（Kotlin，minSdk 26，targetSdk 34）：局域网发现 → 同步 → 新建/划掉 → 到点本地通知。
+交付前的人工验收步骤见 `docs/人工验收清单.md`。
 编译、装机、与桌面端的协议契约见 `android/README.md`。产物 `android/app/build/outputs/apk/debug/app-debug.apk`。
 
 ## 打包
