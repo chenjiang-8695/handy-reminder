@@ -581,14 +581,60 @@ def grab_screen_png(bbox: tuple[int, int, int, int]) -> bytes:
 
 # ---------------------------------------------------------------- 验收量化
 
+def _flatten(text: str) -> str:
+    """比对前把空白(含 OCR 的换行/空格)抹平。
+
+    实测教训: 多行截图里 OCR 会按行返回带 \n 的文本, 而人工标注通常不带换行 ——
+    逐字 zip 比对时每个换行都会错一位, 后面整句跟着错位, 同一张几乎全对的图能被算成 13%。
+    空白差异不是识别错误, 不该计入准确率; 标点差异仍然计入。
+    """
+    return "".join(ch for ch in text if not ch.isspace())
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein 距离 (纯 Python, 一行 DP)。只用于评估, 不在识别路径上。"""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _char_accuracy(got: str, want: str) -> tuple[int, int]:
+    """返回 (命中字符数, 总字符数), 命中 = 总长 - 编辑距离。
+
+    为什么不用"逐位相等": OCR 少认一个字符, 后面的字符全部错位, 逐位比对会把
+    一张 141 字里只错 5 个字的图算成 12%。PRD 4.2 要的是"准确率"这个数,
+    标准做法是 1 - 编辑距离/长度 (字符错误率 CER 的补数)。
+    """
+    if not want:
+        return 0, 0
+    distance = _edit_distance(got, want)
+    return max(0, len(want) - distance), len(want)
+
+
 def evaluate(engine: OcrEngine, samples: list[tuple[bytes, str]]) -> dict:
     """PRD 4.2 的"识别准确率需满足实际使用需求"必须可度量:
-    给一批 (截图, 人工标注文本) 计算 字符准确率 与 时间抽取准确率。"""
+    给一批 (截图, 人工标注文本) 计算 字符准确率 与 时间抽取准确率。
+
+    字符准确率按"抹平空白后逐位相等"统计; 时间抽取准确率按"这段文本里有人工标注的时间,
+    识别结果里也解析出了时间"统计。
+    """
     char_total = char_hit = time_total = time_hit = 0
     for png, truth in samples:
-        got = engine.recognize(preprocess(png))
-        char_total += len(truth)
-        char_hit += sum(1 for a, b in zip(got, truth) if a == b)
+        got = _flatten(engine.recognize(preprocess(png)))
+        want = _flatten(truth)
+        hit, total = _char_accuracy(got, want)
+        char_hit += hit
+        char_total += total
         if parse_time(truth):
             time_total += 1
             time_hit += int(bool(parse_time(got)))
