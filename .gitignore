@@ -22,3 +22,10 @@ logs/
 # 内部文档 (交接说明 / 答疑 / 旧云端设计 / 阶段计划 / 使用说明等)
 # 本仓库按开源基础版准备, 这类材料不进 git 历史 —— 删文件容易, 删历史难
 docs/
+
+# 安卓 (构建产物与本机 sdk 路径不入库)
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/

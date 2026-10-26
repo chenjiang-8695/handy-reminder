@@ -6,7 +6,7 @@
 
 ```bash
 python -m pip install -r requirements.txt        # 必需: tzdata, PySide6
-python -m pytest tests -q                        # 18 个测试文件，见下
+python -m pytest tests -q                        # 19 个测试文件，见下
 python -m reminder_assistant --selftest          # 端到端时间线自检
 python -m reminder_assistant --serve             # 常驻: 便签悬浮窗 + Alt+Q 圈选
 python -m reminder_assistant --autostart on      # 开机自启
@@ -56,7 +56,7 @@ reminder_assistant/
   resources.py   打包后资源定位（_MEIPASS）
   winconsole.py  窗口化构建下附着父控制台 + 标准输出统一 UTF-8，一个 exe 兼当 CLI
 packaging/       PyInstaller spec（含瘦身过滤）/ 图标与版本信息生成器 / 构建与校验脚本
-tests/           18 个自动化测试文件（见下文测试章节）
+tests/           19 个自动化测试文件（见下文测试章节）
 ```
 
 ## 测试
@@ -65,7 +65,7 @@ tests/           18 个自动化测试文件（见下文测试章节）
 python -m pytest tests -q
 ```
 
-当前仓库包含 **18 个测试文件**（330 通过 / 31 跳过；UI/环境相关用例会自动跳过）：
+当前仓库包含 **19 个测试文件**（332 通过 / 31 跳过；UI/环境相关用例会自动跳过）：
 
 | 测试文件 | 说明 |
 |---|---|
@@ -87,6 +87,12 @@ python -m pytest tests -q
 | `test_relay.py` | 三端转发（A→B→C / origin 不丢 / 多轮不重复） |
 | `test_sync_badge.py` | 便签上的「待同步 N 条」提示（单机不显示 / 确认后消失） |
 | `test_punch.py` | 打洞（STUN 解析 / 票据 / 回环打洞 / 打洞后同步 / 失败不丢数据） |
+| `test_android_protocol.py` | 安卓客户端帧格式 × 桌面端服务端（跨语言契约） |
+
+## 安卓端
+
+`android/` 是一个独立的 Gradle 工程（Kotlin，minSdk 26，targetSdk 34）：局域网发现 → 同步 → 到点本地通知。
+编译、装机、与桌面端的协议契约见 `android/README.md`。产物 `android/app/build/outputs/apk/debug/app-debug.apk`。
 
 ## 打包
 
