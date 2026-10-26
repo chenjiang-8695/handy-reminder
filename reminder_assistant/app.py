@@ -821,6 +821,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sync-name", default=None, help="设备名 (显示在对端), 默认用主机名")
     p.add_argument("--sync-scan", nargs="?", type=float, const=5.0, default=None, metavar="秒",
                    help="局域网里找一找有哪些设备在等同步 (默认找 5 秒)")
+    p.add_argument("--punch-host", nargs="?", type=int, const=0, default=None, metavar="端口",
+                   help="跨网络打洞: 打印票据等对方来同步 (可选本地 UDP 端口)")
+    p.add_argument("--punch-join", default=None, metavar="票据",
+                   help="跨网络打洞: 贴对方的票据, 打洞后同步一次")
     p.add_argument("--page-port", type=int, default=8766, help="手机端网页端口")
     p.add_argument("--no-toast", action="store_true", help="不用系统通知, 只在控制台输出")
     p.add_argument("--hotkey", default=None, help="覆盖设置里的全局快捷键, 如 alt+q")
@@ -876,6 +880,60 @@ def main(argv: list[str] | None = None) -> int:
         _print_board(app)
         app.close()
         return 0
+
+    if args.punch_host is not None or args.punch_join:
+        from .sync_link import serve_punch, sync_over_punch
+        from .sync_punch import PunchError, PunchLink, decode_ticket, encode_ticket, stun_endpoint
+
+        name = args.sync_name or ""
+        link = PunchLink(int(args.punch_host or 0), device_id=app.store.device_id())
+        try:
+            public = stun_endpoint(sock=link.sock)
+            if not public:
+                print("打洞不可用: 连不上 STUN 服务器(可能被当前网络挡了 UDP)。\n"
+                      "改动不会丢, 回到同一 WiFi 用 --peer 同步即可。")
+                return 1
+            mine = encode_ticket(app.store.device_id(), public, name=name)
+            print("我的票据(整串发给对方, 对方贴到 --punch-join 后面):")
+            print("  " + mine)
+
+            if args.punch_host is not None:
+                try:
+                    peer = decode_ticket(input("把对方的票据粘在这里后回车: "))
+                except EOFError:
+                    print("没有收到对方票据")
+                    return 2
+                print(f"正在打洞 {peer['ip']}:{peer['port']} (最多等 25 秒)…")
+                if not link.punch((peer["ip"], peer["port"]), 25.0):
+                    print("打洞失败: 两边的 NAT 打不通(手机 4G/5G、路由器不支持回环时常见)。\n"
+                          f"当前 {app.store.outbox_count('pending')} 条改动留在本地, 一条没丢。\n"
+                          "下一步: 两端连同一个 WiFi 后跑 --peer auto, 或者等它们回同一网络自动补发。")
+                    return 1
+                print("通了, 等对方来同步…")
+                serve_punch(app.store, link, name=name)
+                print("同步结束")
+                return 0
+
+            peer = decode_ticket(args.punch_join)
+            print(f"正在打洞 {peer['ip']}:{peer['port']} (最多等 25 秒)…")
+            print("  提示: 现在把上面我的票据发给对方, 让对方开始打洞")
+            if not link.punch((peer["ip"], peer["port"]), 25.0):
+                print("打洞失败: 两边的 NAT 打不通(手机 4G/5G、路由器不支持回环时常见)。\n"
+                      f"当前 {app.store.outbox_count('pending')} 条改动留在本地, 一条没丢。\n"
+                      "下一步: 两端连同一个 WiFi 后跑 --peer auto, 或者等它们回同一网络自动补发。")
+                return 1
+            result = sync_over_punch(app.store, link, name=name)
+            print(f"对端 {result['peer_name']}  拉到 {result['pulled']} 条, 推过去 {result['pushed']} 条")
+            print(f"  本端应用: {result['apply']}")
+            print(f"  对端应用: {result['peer_apply']}")
+            return 0
+        except PunchError as exc:
+            print(f"打洞失败: {exc}")
+            print(f"当前 {app.store.outbox_count('pending')} 条改动留在本地, 不会丢。")
+            return 1
+        finally:
+            link.close()
+            app.close()
 
     if args.peer or args.sync_listen or args.sync_scan is not None:
         from .sync_discovery import Discovery

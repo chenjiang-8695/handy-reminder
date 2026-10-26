@@ -78,20 +78,21 @@ def apply_ops(store: Store, ops: list[dict], peer: str) -> dict:
     return stats
 
 
-def _handle_connection(store: Store, conn: socket.socket, name: str) -> None:
-    hello = _recv(conn)
+def serve_exchange(store: Store, name: str, send, recv) -> None:
+    """在一条"能收发帧"的通路上当服务端。与传输无关 —— TCP 和打洞后的 UDP 共用这一份。"""
+    hello = recv()
     if not hello or hello.get("type") != "hello":
         return
     peer = str(hello.get("device_id") or "")
     if not peer:
         return
     if int(hello.get("protocol") or 0) != PROTOCOL:
-        _send(conn, {"type": "error", "reason": f"协议版本不支持: {hello.get('protocol')}"})
+        send({"type": "error", "reason": f"协议版本不支持: {hello.get('protocol')}"})
         return
-    _send(conn, {"type": "hello", "device_id": store.device_id(), "name": name,
-                 "protocol": PROTOCOL, "cursor": store.cursor_of(peer)})
+    send({"type": "hello", "device_id": store.device_id(), "name": name,
+          "protocol": PROTOCOL, "cursor": store.cursor_of(peer)})
     while True:
-        frame = _recv(conn)
+        frame = recv()
         if not frame:
             return
         kind = frame.get("type")
@@ -102,7 +103,7 @@ def _handle_connection(store: Store, conn: socket.socket, name: str) -> None:
             # 不把对端自己产生的操作再回给它 (它会认出 duplicate, 但白跑一趟):
             # 它本来就有这些, 真丢了自己待发箱里也还在。
             ops = [r for r in rows if str(r.get("origin") or "") != peer]
-            _send(conn, {"type": "push", "ops": ops, "last_id": last})
+            send({"type": "push", "ops": ops, "last_id": last})
         elif kind == "push":
             ops = frame.get("ops") or []
             stats = apply_ops(store, ops, peer)
@@ -112,11 +113,17 @@ def _handle_connection(store: Store, conn: socket.socket, name: str) -> None:
             last = int(frame.get("last_id") or 0)
             if last:
                 store.set_cursor(peer, last)
-            _send(conn, {"type": "ack", "last_id": last, "stats": stats})
+            send({"type": "ack", "last_id": last, "stats": stats})
         elif kind in ("ack", "ping"):
             continue                                  # 单方面确认, 无需回应
         else:
             return                                    # bye / 未知帧: 收工
+
+
+def _handle_connection(store: Store, conn: socket.socket, name: str) -> None:
+    serve_exchange(store, name,
+                   send=lambda frame: _send(conn, frame),
+                   recv=lambda: _recv(conn))
 
 
 class SyncServer(threading.Thread):
@@ -154,38 +161,56 @@ class SyncServer(threading.Thread):
             pass
 
 
+def run_sync(store: Store, send, recv, name: str = "") -> dict:
+    """主动同步一次 (与传输无关): 握手 → 拉 → 应用 → 确认 → 推 → 收确认。"""
+    send({"type": "hello", "device_id": store.device_id(),
+          "name": name or socket.gethostname(), "protocol": PROTOCOL})
+    hello = recv()
+    if not hello or hello.get("type") != "hello":
+        raise SyncError(f"对端没有正常握手: {hello}")
+    peer = str(hello["device_id"])
+    peer_cursor = int(hello.get("cursor") or 0)
+
+    cursor = store.cursor_of(peer)
+    send({"type": "pull", "cursor": cursor})
+    pulled = recv() or {}
+    ops = pulled.get("ops") or []
+    stats = apply_ops(store, ops, peer)
+    relayed = store.relay_ops(ops, peer)      # 拉到的也要能转给第三个设备
+    last = int(pulled.get("last_id") or cursor)
+    if last:
+        store.set_cursor(peer, last)               # 先记水位再确认: 宁可重放也不重复
+    send({"type": "ack", "last_id": last, "stats": stats})
+
+    rows = store.outbox_after(peer_cursor)
+    my_last = int(rows[-1]["id"]) if rows else peer_cursor
+    # 同样的道理: 不把"从它那儿转来的"操作再推回给它 (服务端也会认 duplicate, 但白跑一趟)
+    mine = [o for o in rows if str(o.get("origin") or "") != peer]
+    send({"type": "push", "ops": mine, "last_id": my_last})
+    ack = recv() or {}
+    send({"type": "bye"})
+
+    return {"peer": peer, "peer_name": hello.get("name"), "pulled": len(ops),
+            "pushed": len(mine), "relayed": relayed, "apply": stats,
+            "peer_apply": ack.get("stats") or {}}
+
+
 def sync_once(store: Store, host: str = "127.0.0.1", port: int = 0,
               timeout: float = 10.0, name: str = "") -> dict:
-    """主动连一次对端: 握手 → 拉 → 应用 → 确认 → 推 → 收确认。返回本次战果。"""
+    """走 TCP 主动连一次对端 (局域网 / 手工填 IP)。"""
     with socket.create_connection((host, int(port)), timeout=timeout) as sock:
         sock.settimeout(timeout)
-        _send(sock, {"type": "hello", "device_id": store.device_id(),
-                     "name": name or socket.gethostname(), "protocol": PROTOCOL})
-        hello = _recv(sock)
-        if not hello or hello.get("type") != "hello":
-            raise SyncError(f"对端没有正常握手: {hello}")
-        peer = str(hello["device_id"])
-        peer_cursor = int(hello.get("cursor") or 0)
+        return run_sync(store,
+                        send=lambda frame: _send(sock, frame),
+                        recv=lambda: _recv(sock),
+                        name=name)
 
-        cursor = store.cursor_of(peer)
-        _send(sock, {"type": "pull", "cursor": cursor})
-        pulled = _recv(sock) or {}
-        ops = pulled.get("ops") or []
-        stats = apply_ops(store, ops, peer)
-        relayed = store.relay_ops(ops, peer)      # 拉到的也要能转给第三个设备
-        last = int(pulled.get("last_id") or cursor)
-        if last:
-            store.set_cursor(peer, last)               # 先记水位再确认: 宁可重放也不重复
-        _send(sock, {"type": "ack", "last_id": last, "stats": stats})
 
-        rows = store.outbox_after(peer_cursor)
-        my_last = int(rows[-1]["id"]) if rows else peer_cursor
-        # 同样的道理: 不把"从它那儿转来的"操作再推回给它 (服务端也会认 duplicate, 但白跑一趟)
-        mine = [o for o in rows if str(o.get("origin") or "") != peer]
-        _send(sock, {"type": "push", "ops": mine, "last_id": my_last})
-        ack = _recv(sock) or {}
-        _send(sock, {"type": "bye"})
+def sync_over_punch(store: Store, link, name: str = "") -> dict:
+    """走打洞成功后的 UDP 通路同步一次 (跨网络)。"""
+    return run_sync(store, send=link.send_frame, recv=lambda: link.recv_frame(), name=name)
 
-        return {"peer": peer, "peer_name": hello.get("name"), "pulled": len(ops),
-                "pushed": len(mine), "relayed": relayed, "apply": stats,
-                "peer_apply": ack.get("stats") or {}}
+
+def serve_punch(store: Store, link, name: str = "") -> None:
+    """在打洞成功后的 UDP 通路上当服务端, 直到对端 bye 或超时。"""
+    serve_exchange(store, name, send=link.send_frame, recv=lambda: link.recv_frame())

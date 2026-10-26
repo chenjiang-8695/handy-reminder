@@ -6,7 +6,7 @@
 
 ```bash
 python -m pip install -r requirements.txt        # 必需: tzdata, PySide6
-python -m pytest tests -q                        # 17 个测试文件，见下
+python -m pytest tests -q                        # 18 个测试文件，见下
 python -m reminder_assistant --selftest          # 端到端时间线自检
 python -m reminder_assistant --serve             # 常驻: 便签悬浮窗 + Alt+Q 圈选
 python -m reminder_assistant --autostart on      # 开机自启
@@ -17,6 +17,10 @@ python -m reminder_assistant --sync-listen 8767  # 本机监听 (顺带广播自
 python -m reminder_assistant --sync-scan         # 找找局域网里谁在等同步
 python -m reminder_assistant --peer auto         # 自动发现后同步一次
 python -m reminder_assistant --peer 192.168.1.7:8767   # 手工指定对端
+
+# 跨网络打洞 (尽力而为: 家用宽带多半能通, 手机 4G/5G 常打不通)
+python -m reminder_assistant --punch-host 9011         # 打印票据, 等对方来同步
+python -m reminder_assistant --punch-join "HR1|ip|port|设备号|名字"   # 贴对方票据, 同步一次
 ```
 
 **便签怎么用**：纸头右上角四个小按钮 —— ＋ 添加（在下面的输入行写一句
@@ -48,10 +52,11 @@ reminder_assistant/
   ui/settings_dialog.py  设置面板 + 单条提醒的「高级事件」频率面板（含实时预览、组合键格式实时校验）
   sync_link.py   设备间同步线缆层（TCP + 长度前缀帧; 先拉后推; 冲突判定在 store）
   sync_discovery.py  局域网发现（UDP 广播信标; 探测包即时回包; 15 秒无心跳算离开）
+  sync_punch.py      跨网络打洞（最小 STUN 客户端; 明文票据; UDP 上的序号/确认/重发）
   resources.py   打包后资源定位（_MEIPASS）
   winconsole.py  窗口化构建下附着父控制台 + 标准输出统一 UTF-8，一个 exe 兼当 CLI
 packaging/       PyInstaller spec（含瘦身过滤）/ 图标与版本信息生成器 / 构建与校验脚本
-tests/           17 个自动化测试文件（见下文测试章节）
+tests/           18 个自动化测试文件（见下文测试章节）
 ```
 
 ## 测试
@@ -60,7 +65,7 @@ tests/           17 个自动化测试文件（见下文测试章节）
 python -m pytest tests -q
 ```
 
-当前仓库包含 **17 个测试文件**（311 通过 / 30 跳过；UI/环境相关用例会自动跳过）：
+当前仓库包含 **18 个测试文件**（330 通过 / 31 跳过；UI/环境相关用例会自动跳过）：
 
 | 测试文件 | 说明 |
 |---|---|
@@ -81,6 +86,7 @@ python -m pytest tests -q
 | `test_discovery.py` | 局域网发现（UDP 信标 / 探测包 / 发现后直接同步） |
 | `test_relay.py` | 三端转发（A→B→C / origin 不丢 / 多轮不重复） |
 | `test_sync_badge.py` | 便签上的「待同步 N 条」提示（单机不显示 / 确认后消失） |
+| `test_punch.py` | 打洞（STUN 解析 / 票据 / 回环打洞 / 打洞后同步 / 失败不丢数据） |
 
 ## 打包
 
