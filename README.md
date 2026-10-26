@@ -1,5 +1,12 @@
 # 智能手账式悬浮提醒助手（参考实现）
 
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)](#)
+[![android](https://img.shields.io/badge/android-8.0%2B%20(API%2026)-3ddc84)](#)
+[![tests](https://img.shields.io/badge/tests-343%20passed-brightgreen)](#测试)
+[![sync](https://img.shields.io/badge/sync-LAN%20%2B%20P2P%20punch-orange)](#跨端同步)
+
 把《智能手账式悬浮提醒助手》PRD 落成**可运行、可测试**的桌面端参考实现。当前为**开源基础版**：仅保留核心代码、测试与打包脚本，不包含内部文档、演示截图、客户资料与敏感测试数据。
 
 ## 60 秒上手
@@ -112,5 +119,10 @@ python packaging/build.py --check-only   # 结构校验（不生成产物）
 ## 说明
 
 - 本仓库为开源基础版，仅保留可运行、可测试的代码与测试。
-- `docs/` 里有：交接说明、同步方案-B版（本方案）、云端同步与数据模型设计（旧版，云端事实源）、阶段一实施计划、总体方案、技术介绍、演示脚本、答疑两篇、识别抗干扰方案、免安装版使用说明。
+- 内部文档（交接说明、同步方案、阶段计划、答疑等）与客户资料保留在本地，**不入库**；仓库里只有可运行、可测试的代码。
 - 测试数据、报告截图、客户需求、测试反馈等已移出仓库，请从原工作目录获取。
+
+## 许可
+
+代码以 [MIT](LICENSE) 许可发布。内置字体 **霞鹜文楷 LXGW WenKai** 使用 SIL Open Font License 1.1，
+许可全文见 `reminder_assistant/assets/fonts/OFL-LXGWWenKai.txt`。
