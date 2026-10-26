@@ -4,7 +4,7 @@
 [![python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)](#)
 [![android](https://img.shields.io/badge/android-8.0%2B%20(API%2026)-3ddc84)](#)
-[![tests](https://img.shields.io/badge/tests-343%20passed-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-342%20passed%20%2F%2031%20skipped-brightgreen)](#测试)
 [![sync](https://img.shields.io/badge/sync-LAN%20%2B%20P2P%20punch-orange)](#跨端同步)
 
 把《智能手账式悬浮提醒助手》PRD 落成**可运行、可测试**的桌面端参考实现。当前为**开源基础版**：仅保留核心代码、测试与打包脚本，不包含内部文档、演示截图、客户资料与敏感测试数据。
