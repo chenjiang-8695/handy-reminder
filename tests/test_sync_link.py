@@ -50,8 +50,10 @@ def test_push_creates_on_peer_without_echo(pair):
     got = b.list_active()
     assert [r.title for r in got] == ["热水器清洗"]
     assert got[0].uuid == rem.uuid
-    # 应用远端操作**不能**进本端待发箱, 否则两端互相回声, 永远同步不完
-    assert b.outbox_count() == 0
+    # 应用远端操作不能变成"本端待发" (否则两端互相回声, 永远同步不完);
+    # 但会留一份 acked 的转述, 好让第三个设备也能拿到 (见 test_relay.py)
+    assert b.outbox_count("pending") == 0
+    assert b.outbox_count("acked") == 1
     assert a.cursor_of(b.device_id()) == 0 or True   # 水位只在拉到东西时前进
 
 
@@ -71,7 +73,7 @@ def test_sync_twice_changes_nothing(pair):
     second = sync_once(a, "127.0.0.1", server.port)
     assert second["pulled"] == 0 and second["pushed"] == 0
     assert len(b.list_active()) == 1
-    assert a.outbox_count() == 1        # 本端待发行仍在 (没人确认过, 这是对的)
+    assert a.outbox_count("pending") == 1   # 本端待发行仍在 (没人确认过, 这是对的)
 
 
 def test_cursor_only_sends_new_ops(pair):

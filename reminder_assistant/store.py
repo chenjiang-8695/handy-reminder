@@ -43,7 +43,7 @@ def _d(v: str | None) -> datetime | None:
     return datetime.fromisoformat(v) if v else None
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # reminders 的同步列 (列名, 建列声明) —— **唯一定义**。
 # 新建库走下面的 SCHEMA, 老库走 _add_missing_columns() 的 ALTER;
@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS outbox(
   state        TEXT    NOT NULL DEFAULT 'pending',  -- pending|inflight|acked|dead
   attempts     INTEGER NOT NULL DEFAULT 0,
   last_error   TEXT,
-  depend_on    TEXT                            -- 同批次的前序 op_id (向导批量创建)
+  depend_on    TEXT,                           -- 同批次的前序 op_id (向导批量创建)
+  origin       TEXT    NOT NULL DEFAULT ''      -- 这条操作最初发生在哪台设备 (转发后不变)
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_state ON outbox(state, id);
 
@@ -180,6 +181,8 @@ class Store:
         except Exception:
             self.close()            # 迁移失败别把实例锁和连接留在那儿
             raise
+        self._device_id = ""
+        self.device_id()            # 身份号在启动时定下来并缓存, 写路径里不再碰事务
         self.recover_inflight()
 
     # ------------------------------------------------------------ 迁移
@@ -199,6 +202,7 @@ class Store:
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
                 self._add_missing_columns()
+                self._add_outbox_columns()
                 filled = self._backfill_uuids()
                 # 唯一索引必须在 uuid 回填之后建。且必须是**部分索引**:
                 # 老代码/测试可能绕过 add_reminder 直接插 uuid='' 的行,
@@ -220,6 +224,15 @@ class Store:
             if name not in have:
                 self.conn.execute(f"ALTER TABLE reminders ADD COLUMN {name} {decl}")
                 added.append(name)
+        return added
+
+    def _add_outbox_columns(self) -> list[str]:
+        """outbox 的列也要能补: 三端转发靠 origin 判断这条最初是谁改的。"""
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(outbox)")}
+        added: list[str] = []
+        if "origin" not in have:
+            self.conn.execute("ALTER TABLE outbox ADD COLUMN origin TEXT NOT NULL DEFAULT ''")
+            added.append("origin")
         return added
 
     def _backfill_uuids(self) -> int:
@@ -486,10 +499,10 @@ class Store:
         """
         op_id = new_uuid()
         self.conn.execute(
-            "INSERT INTO outbox(op_id, uuid, op_type, payload, base_version, created_at, depend_on)"
-            " VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO outbox(op_id, uuid, op_type, payload, base_version, created_at,"
+            " depend_on, origin) VALUES(?,?,?,?,?,?,?,?)",
             (op_id, uuid_, op_type, json.dumps(payload or {}, ensure_ascii=False),
-             int(base_version), _s(datetime.now()), depend_on))
+             int(base_version), _s(datetime.now()), depend_on, self.device_id()))
         return op_id
 
     def _bump_version(self, rid: int) -> int:
@@ -532,16 +545,24 @@ class Store:
 
     # ------------------------------------------------------------ 应用对端操作 (阶段二)
     def device_id(self) -> str:
-        """本机身份号 (首次调用时生成, 之后一直不变)。冲突打平与配对都靠它。"""
+        """本机身份号 (首次调用时生成, 之后一直不变)。冲突打平与配对都靠它。
+
+        结果缓存在实例上: 写业务数据的事务里会用到它 (每条待发行都记 origin),
+        那里绝不能为了读一个身份号去开新事务 —— 嵌套事务会把半截改动提前提交。
+        """
+        if self._device_id:
+            return self._device_id
         with self._lock, self.conn:
             row = self.conn.execute("SELECT v FROM meta WHERE k='sync.device_id'").fetchone()
             if row and row["v"]:
-                return str(row["v"])
+                self._device_id = str(row["v"])
+                return self._device_id
             did = new_uuid()
             self.conn.execute(
                 "INSERT INTO meta(k,v) VALUES('sync.device_id',?)"
                 " ON CONFLICT(k) DO UPDATE SET v=excluded.v", (did,))
-            return did
+        self._device_id = did
+        return did
 
     def applied(self, op_id: str) -> bool:
         with self._lock:
@@ -552,6 +573,37 @@ class Store:
         self.conn.execute(
             "INSERT OR IGNORE INTO applied_ops(op_id, applied_at, peer) VALUES(?,?,?)",
             (op_id, _s(datetime.now()), peer))
+
+    def relay_ops(self, ops: list[dict], peer: str = "") -> int:
+        """把对端推来的操作记进本机待发箱, 让第三个设备也能拉到 (三端 mesh 的转发路径)。
+
+        A 与 C 直连不通时, 由 B 中转: B 自己不产生更改, 但要把 A 的操作转述给 C。
+        记成 state='acked' 是为了让它**不进本端的重试队列** (它不是本端的改动),
+        而 pull 只按 id 取、不看 state, 所以照样能被其它对端拉走。
+        op_id 保留原值 (INSERT OR IGNORE), 于是同一条操作在网里绕一圈也只生效一次。
+        """
+        mine = self.device_id()
+        added = 0
+        with self._lock, self.conn:
+            for op in ops:
+                op_id = str(op.get("op_id") or "")
+                uuid_ = str(op.get("uuid") or "")
+                op_type = str(op.get("op_type") or "")
+                if not (op_id and uuid_ and op_type):
+                    continue
+                origin = str(op.get("origin") or peer or "")
+                if origin == mine:
+                    continue                      # 自己发出去的, 本来就在待发箱里
+                payload = op.get("payload") or {}
+                if not isinstance(payload, str):
+                    payload = json.dumps(payload, ensure_ascii=False)
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO outbox(op_id, uuid, op_type, payload, base_version,"
+                    " created_at, state, attempts, origin) VALUES(?,?,?,?,?,?,'acked',0,?)",
+                    (op_id, uuid_, op_type, payload, int(op.get("base_version") or 0),
+                     op.get("created_at") or _s(datetime.now()), origin))
+                added += cur.rowcount
+        return added
 
     def outbox_after(self, cursor: int = 0, limit: int = 500) -> list[dict]:
         """取游标之后的操作。游标就是对端最后应用的那条 outbox.id (库内自增, 顺序即因果顺序)。"""
@@ -630,7 +682,7 @@ class Store:
             payload = json.loads(payload or "{}")
         version = int(payload.get("version") or op.get("base_version") or 0)
         mine = self.device_id()
-        origin = str(op.get("origin") or peer or "")
+        origin = str(op.get("origin") or peer or "")      # 转发来的操作带着最初的设备号
 
         with self._lock, self.conn:
             if self.conn.execute("SELECT 1 FROM applied_ops WHERE op_id=?", (op_id,)).fetchone():

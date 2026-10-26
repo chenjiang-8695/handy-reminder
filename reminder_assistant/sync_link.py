@@ -96,11 +96,19 @@ def _handle_connection(store: Store, conn: socket.socket, name: str) -> None:
             return
         kind = frame.get("type")
         if kind == "pull":
-            ops = store.outbox_after(int(frame.get("cursor") or 0))
-            last = int(ops[-1]["id"]) if ops else int(frame.get("cursor") or 0)
+            cursor = int(frame.get("cursor") or 0)
+            rows = store.outbox_after(cursor)
+            last = int(rows[-1]["id"]) if rows else cursor
+            # 不把对端自己产生的操作再回给它 (它会认出 duplicate, 但白跑一趟):
+            # 它本来就有这些, 真丢了自己待发箱里也还在。
+            ops = [r for r in rows if str(r.get("origin") or "") != peer]
             _send(conn, {"type": "push", "ops": ops, "last_id": last})
         elif kind == "push":
-            stats = apply_ops(store, frame.get("ops") or [], peer)
+            ops = frame.get("ops") or []
+            stats = apply_ops(store, ops, peer)
+            # 三端 mesh: 把别人的操作记进本机待发箱, 好让第三个设备也能拉到。
+            # 自己发的那些会被 relay_ops 跳过 (本来就在待发箱里)。
+            stats["relayed"] = store.relay_ops(ops, peer)
             last = int(frame.get("last_id") or 0)
             if last:
                 store.set_cursor(peer, last)
@@ -164,17 +172,20 @@ def sync_once(store: Store, host: str = "127.0.0.1", port: int = 0,
         pulled = _recv(sock) or {}
         ops = pulled.get("ops") or []
         stats = apply_ops(store, ops, peer)
+        relayed = store.relay_ops(ops, peer)      # 拉到的也要能转给第三个设备
         last = int(pulled.get("last_id") or cursor)
         if last:
             store.set_cursor(peer, last)               # 先记水位再确认: 宁可重放也不重复
         _send(sock, {"type": "ack", "last_id": last, "stats": stats})
 
-        mine = store.outbox_after(peer_cursor)
-        my_last = int(mine[-1]["id"]) if mine else peer_cursor
+        rows = store.outbox_after(peer_cursor)
+        my_last = int(rows[-1]["id"]) if rows else peer_cursor
+        # 同样的道理: 不把"从它那儿转来的"操作再推回给它 (服务端也会认 duplicate, 但白跑一趟)
+        mine = [o for o in rows if str(o.get("origin") or "") != peer]
         _send(sock, {"type": "push", "ops": mine, "last_id": my_last})
         ack = _recv(sock) or {}
         _send(sock, {"type": "bye"})
 
         return {"peer": peer, "peer_name": hello.get("name"), "pulled": len(ops),
-                "pushed": len(mine), "apply": stats,
+                "pushed": len(mine), "relayed": relayed, "apply": stats,
                 "peer_apply": ack.get("stats") or {}}

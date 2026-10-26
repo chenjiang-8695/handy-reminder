@@ -6,7 +6,7 @@
 
 ```bash
 python -m pip install -r requirements.txt        # 必需: tzdata, PySide6
-python -m pytest tests -q                        # 15 个测试文件，见下
+python -m pytest tests -q                        # 16 个测试文件，见下
 python -m reminder_assistant --selftest          # 端到端时间线自检
 python -m reminder_assistant --serve             # 常驻: 便签悬浮窗 + Alt+Q 圈选
 python -m reminder_assistant --autostart on      # 开机自启
@@ -51,7 +51,7 @@ reminder_assistant/
   resources.py   打包后资源定位（_MEIPASS）
   winconsole.py  窗口化构建下附着父控制台 + 标准输出统一 UTF-8，一个 exe 兼当 CLI
 packaging/       PyInstaller spec（含瘦身过滤）/ 图标与版本信息生成器 / 构建与校验脚本
-tests/           15 个自动化测试文件（见下文测试章节）
+tests/           16 个自动化测试文件（见下文测试章节）
 ```
 
 ## 测试
@@ -60,7 +60,7 @@ tests/           15 个自动化测试文件（见下文测试章节）
 python -m pytest tests -q
 ```
 
-当前仓库包含 **15 个测试文件**（299 通过 / 31 跳过；UI/环境相关用例会自动跳过）：
+当前仓库包含 **16 个测试文件**（306 通过 / 31 跳过；UI/环境相关用例会自动跳过）：
 
 | 测试文件 | 说明 |
 |---|---|
@@ -79,6 +79,7 @@ python -m pytest tests -q
 | `test_outbox.py` | 跨端待发箱（每次操作恰一条 / 墓碑 / 重启不丢） |
 | `test_sync_link.py` | 设备间同步（真 TCP 双实例 / 冲突 / 删除优先） |
 | `test_discovery.py` | 局域网发现（UDP 信标 / 探测包 / 发现后直接同步） |
+| `test_relay.py` | 三端转发（A→B→C / origin 不丢 / 多轮不重复） |
 
 ## 打包
 
