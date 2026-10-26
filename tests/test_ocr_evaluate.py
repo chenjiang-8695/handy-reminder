@@ -76,4 +76,23 @@ def test_time_extraction_accuracy():
 
 def test_empty_samples_is_zero_not_crash():
     result = ocr.evaluate(FakeEngine("x"), [])
-    assert result == {"char_accuracy": 0.0, "time_extract_accuracy": 0.0, "samples": 0}
+    assert result["samples"] == 0
+    assert result["char_accuracy"] == 0.0
+    assert result["time_extract_accuracy"] == 0.0
+    assert result["time_value_accuracy"] == 0.0
+
+
+def test_time_value_accuracy_catches_wrong_hour():
+    """识别出"下午三点"但图上是"下午三点"才算对; 认成"上午三点"也要判错。"""
+    right = ocr.evaluate(FakeEngine("明天下午三点开会"), [(PNG, "明天下午三点开会")])
+    assert right["time_value_accuracy"] == 1.0
+
+    wrong = ocr.evaluate(FakeEngine("明天上午三点开会"), [(PNG, "明天下午三点开会")])
+    assert wrong["time_extract_accuracy"] == 1.0     # 提取到了时间
+    assert wrong["time_value_accuracy"] < 1.0        # 但值不对
+
+
+def test_time_value_accuracy_ignores_seconds():
+    got = FakeEngine("10月28日14:30 面试")
+    result = ocr.evaluate(got, [(PNG, "10月28日 14:30:59 面试")])
+    assert result["time_value_accuracy"] == 1.0

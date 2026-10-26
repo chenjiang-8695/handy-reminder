@@ -621,6 +621,16 @@ def _char_accuracy(got: str, want: str) -> tuple[int, int]:
     return max(0, len(want) - distance), len(want)
 
 
+def _same_minute(a, b) -> bool:
+    """两个时刻是否落在同一分钟 (时区已归一; 秒与微秒不参与比较)。"""
+    try:
+        left = a.replace(second=0, microsecond=0)
+        right = b.replace(second=0, microsecond=0)
+        return left == right
+    except (AttributeError, TypeError):
+        return False
+
+
 def evaluate(engine: OcrEngine, samples: list[tuple[bytes, str]]) -> dict:
     """PRD 4.2 的"识别准确率需满足实际使用需求"必须可度量:
     给一批 (截图, 人工标注文本) 计算 字符准确率 与 时间抽取准确率。
@@ -629,17 +639,26 @@ def evaluate(engine: OcrEngine, samples: list[tuple[bytes, str]]) -> dict:
     识别结果里也解析出了时间"统计。
     """
     char_total = char_hit = time_total = time_hit = 0
+    value_total = value_hit = 0
     for png, truth in samples:
         got = _flatten(engine.recognize(preprocess(png)))
         want = _flatten(truth)
         hit, total = _char_accuracy(got, want)
         char_hit += hit
         char_total += total
-        if parse_time(truth):
+        want_time = parse_time(truth)
+        if want_time and want_time.when:
             time_total += 1
-            time_hit += int(bool(parse_time(got)))
+            got_time = parse_time(got)
+            time_hit += int(bool(got_time and got_time.when))
+            # "提取到了时间" 不等于 "提取到了**对的**时间"(下午认成上午也是提取到了)。
+            # 这里再比一层: 解析出的时刻要和人写的一致(精确到分钟)。
+            value_total += 1
+            if got_time and got_time.when:
+                value_hit += int(_same_minute(got_time.when, want_time.when))
     return {
         "char_accuracy": round(char_hit / char_total, 4) if char_total else 0.0,
         "time_extract_accuracy": round(time_hit / time_total, 4) if time_total else 0.0,
+        "time_value_accuracy": round(value_hit / value_total, 4) if value_total else 0.0,
         "samples": len(samples),
     }

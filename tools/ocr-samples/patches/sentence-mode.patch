@@ -1,0 +1,136 @@
+diff --git a/core/instance.py b/core/instance.py
+index d6f79d4..321876f 100644
+--- a/core/instance.py
++++ b/core/instance.py
+@@ -25,13 +25,13 @@ class Instance(object):
+             font = self.parent.image_font["hanzi_font"]
+             for i in range(len(text)):
+                 # 字体发生切换，计算使用上一字体渲染的字符串的尺寸
+-                if text[i] in self.parent.hanzi_font_chars and font != self.parent.image_font["hanzi_font"]:
++                if self.parent.is_cjk(text[i]) and font != self.parent.image_font["hanzi_font"]:
+                     w, h = font.getsize(text[begin: i])
+                     self.width += w
+                     self.height = max(self.height, h)
+                     begin = i
+                     font = self.parent.image_font["hanzi_font"]
+-                elif text[i] not in self.parent.hanzi_font_chars and font != self.parent.image_font["no_hanzi_font"]:
++                elif not self.parent.is_cjk(text[i]) and font != self.parent.image_font["no_hanzi_font"]:
+                     w, h = font.getsize(text[begin: i])
+                     self.width += w
+                     self.height = max(self.height, h)
+@@ -44,7 +44,7 @@ class Instance(object):
+             # ！！！这里务必要注意，font.getsize("abc")[0] != sum(font.getsize(k) for k in "abc")
+             # ！！！因此非0字符间距的字符串计算实例宽度时一定要一个字符一个字符地计算
+             for c in text:
+-                if c in self.parent.hanzi_font_chars:
++                if self.parent.is_cjk(c):
+                     w, h = self.parent.image_font["hanzi_font"].getsize(c)
+                 else:
+                     w, h = self.parent.image_font["no_hanzi_font"].getsize(c)
+diff --git a/core/ocr_sample_generator.py b/core/ocr_sample_generator.py
+index 3660ea9..129ce3f 100644
+--- a/core/ocr_sample_generator.py
++++ b/core/ocr_sample_generator.py
+@@ -48,6 +48,19 @@ class OCRSampleGenerator(object):
+         self.hanzi_w, self.hanzi_h = self.image_font["hanzi_font"].getsize("我")
+         self.letter_w, self.letter_h = self.image_font["no_hanzi_font"].getsize("g")
+     
++    def is_cjk(self, ch):
++        """这个字符该用中文字体还是拉丁字体。
++
++        原来的判定只看 `assets/zidian_new_5883.txt` 的 5883 字 + 中文标点, 于是语料里
++        表外的常用字(周/早/半/货…)会落到拉丁字体上, 渲染成豆腐块 □ —— 样本直接废掉。
++        这里改成按 Unicode 区段判断, 中文字体才是唯一能画中文的那一支。
++        """
++        code = ord(ch)
++        return (ch in self.hanzi_font_chars
++                or 0x2E80 <= code <= 0x9FFF      # 部首 + CJK 基本区
++                or 0xF900 <= code <= 0xFAFF      # 兼容汉字
++                or 0xFF00 <= code <= 0xFFEF)     # 全角字符/标点
++
+     def init_hanzis(self):
+         with open("assets/zidian_new_5883.txt", 'r', encoding="utf-8") as f:
+             text = f.read()
+@@ -104,7 +117,7 @@ class OCRSampleGenerator(object):
+                 if i == len(instance.text):
+                     end_index = i
+                 else:
+-                    if instance.text[i] in self.hanzi_font_chars:
++                    if self.is_cjk(instance.text[i]):
+                         if font != self.image_font["hanzi_font"]:
+                             end_index = i
+                     else:
+@@ -126,7 +139,7 @@ class OCRSampleGenerator(object):
+         # 如果实例的字符间距不是0，那么只能一个字符一个字符地打印
+         else:
+             for k, c in enumerate(instance.text):
+-                if c in self.hanzi_font_chars:
++                if self.is_cjk(c):
+                     font = self.image_font["hanzi_font"]
+                 else:
+                     font = self.image_font["no_hanzi_font"]
+@@ -305,6 +318,19 @@ class OCRSampleGenerator(object):
+         print(text)
+         return Instance(self, text, Category.PTEXT, char_spacing=self.char_spacing)
+ 
++    def put_sentence_line(self, text, tl_y, tl_x=None):
++        """把**指定的句子**画成一行 (句子模式)。
++
++        为什么需要: 随机汉字串里没有真实的时间表达, 用它测不出 PRD 4.2 的"时间语义提取"。
++        句子模式下文本来自语料文件, 其余链路 (字体切换/字符间距/标注/增强/切行) 完全复用。
++        """
++        instance = Instance(self, text, Category.PTEXT, char_spacing=self.char_spacing)
++        if tl_x is None:
++            rest_width = self.canvas_pil.size[0] - instance.width
++            tl_x = int(np.random.randint(1, max(2, rest_width))) if rest_width > 2 else 1
++        self.put_instance(instance, int(tl_x), tl_y)
++        return instance.height
++
+     def put_ptext_line(self, context_config, tl_y, tl_x=1):
+         # 一行中的最大实例数量
+         max_instance_num_per_line = 1
+diff --git a/main.py b/main.py
+index 7a6fe4c..5914576 100644
+--- a/main.py
++++ b/main.py
+@@ -23,6 +23,14 @@ if __name__ == "__main__":
+ 
+     config = parse_py_config(args.src_config_path)
+     print(config)
++
++    # 句子模式: 配置里给了 SENTENCES 列表或 CORPUS_PATH 文件时, 按句子逐行渲染
++    sentences = list(config.get("SENTENCES") or [])
++    if not sentences and config.get("CORPUS_PATH"):
++        with open(config["CORPUS_PATH"], "r", encoding="utf-8") as f:
++            sentences = [ln.strip() for ln in f if ln.strip()]
++    if sentences:
++        print(f"句子模式: 共 {len(sentences)} 句语料")
+     for gn in trange(args.generation_num):
+         # 解析样本参数配置
+         W = parse_random(config["LAYOUT"]["IMAGE_WIDTH"])
+@@ -46,10 +54,21 @@ if __name__ == "__main__":
+         tl_y_offset = np.random.randint(0, 40) - 20
+         tl_y = tl_y_offset
+         line_height = g.font_size
+-        for i in range(g.canvas_pil.height // (g.font_size + g.line_spacing)):
+-            # 绘制一行内容
+-            line_height = g.put_ptext_line(config["CONTEXT"], tl_y)
+-            tl_y += (line_height + g.line_spacing)
++        if sentences:
++            # 句子模式: 一行一句, 画到画布放不下为止 (句子长短不一, 用实际行高累加)
++            pool = sentences[:]          # 每张图内不重复用同一句 (重复句会让字符准确率虚高)
++            random.shuffle(pool)
++            while pool and tl_y < g.canvas_pil.height - g.font_size:
++                line = pool.pop()
++                if g.canvas_pil.size[0] - 20 < g.image_font["hanzi_font"].getsize(line)[0]:
++                    continue                       # 这一行放不下就换一句, 不截断句子
++                line_height = g.put_sentence_line(line, tl_y)
++                tl_y += (line_height + g.line_spacing)
++        else:
++            for i in range(g.canvas_pil.height // (g.font_size + g.line_spacing)):
++                # 绘制一行内容
++                line_height = g.put_ptext_line(config["CONTEXT"], tl_y)
++                tl_y += (line_height + g.line_spacing)
+         g.aug()
+ 
+         if config["BASE_NAME"] == '':
