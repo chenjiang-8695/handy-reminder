@@ -619,6 +619,13 @@ class Store:
                 "SELECT v FROM meta WHERE k=?", (f"sync.cursor.{peer}",)).fetchone()
         return int(row["v"]) if row and row["v"] else 0
 
+    def peer_count(self) -> int:
+        """已经同步过几个对端 (按 meta 里的游标条数算)。用来决定要不要显示"待同步 N 条"。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) c FROM meta WHERE k LIKE 'sync.cursor.%'").fetchone()
+        return int(row["c"]) if row else 0
+
     def set_cursor(self, peer: str, value: int) -> None:
         with self._lock, self.conn:
             self.conn.execute(

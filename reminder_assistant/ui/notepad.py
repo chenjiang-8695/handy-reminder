@@ -540,6 +540,17 @@ class NotepadWindow(QWidget):
             "QPushButton{background:rgba(255,252,244,0.9);border:1px solid #D9CFBC;"
             f"border-radius:9px;padding:0 6px;color:{theme.INK_LIGHT};}}"
             "QPushButton:hover{background:rgba(255,238,200,1.0);}")
+        # 跨端同步的"待同步 N 条" (只有真的配过对端才出现, 单机用户不该看到它)
+        self.sync_label = QLabel("", self)
+        self.sync_label.setFont(theme.handwriting_font(10, bold=False))
+        self.sync_label.setFixedHeight(20)
+        self.sync_label.setAlignment(Qt.AlignCenter)
+        self.sync_label.setStyleSheet(
+            "QLabel{background:rgba(255,236,206,0.95);border:1px solid #D9B98A;"
+            f"border-radius:9px;padding:0 6px;color:{theme.INK_LIGHT};}}")
+        self.sync_label.setVisible(False)
+        self._sync_badge = ""
+
         self.btn_group.clicked.connect(self.cycle_group_mode)
         self.btn_group.setToolTip("任务分类方式：按时间(默认) / 按重要程度 / 按开始日期。"
                                   "默认严格按时间排序。")
@@ -599,6 +610,13 @@ class NotepadWindow(QWidget):
         self.tools.setGeometry(w - theme.PADDING[2] - bw, 4, bw, 22)
         gw = 56
         self.btn_group.setGeometry(w - theme.PADDING[2] - bw - gw - 4, 5, gw, 20)
+        # 待同步标签占用原来"日期"那一格, 宽度跟着窗口走: 便签窄的时候宁可少显示几个字,
+        # 也不能压住右上角那排按钮 (压住了用户就点不到 ＋)
+        bx = theme.PADDING[0] + 86
+        bwid = max(0, (w - theme.PADDING[2] - bw) - bx - 6)
+        self.sync_label.setGeometry(bx, 5, bwid, 20)
+        if bwid < 84:
+            self.sync_label.setVisible(False)
         bottom = h - theme.PADDING[3] - INPUT_H
         pager_w = 20 * 2 + PAGER_LABEL_W + 4
         self.page_pager.setGeometry(theme.PADDING[0], bottom, pager_w, INPUT_H)
@@ -608,6 +626,7 @@ class NotepadWindow(QWidget):
         show = not self._collapsed
         self.tools.setVisible(show)
         self.btn_group.setVisible(show)
+        self.sync_label.setVisible(show and bool(self._sync_badge))
         self.page_pager.setVisible(show)
         self.editor.setVisible(show)
 
@@ -816,6 +835,7 @@ class NotepadWindow(QWidget):
         self.refresh(force=True)
 
     def refresh(self, force: bool = False) -> None:
+        self._refresh_sync_badge()
         active = self._visible_items(self.app.life.board(mode=self.group_mode)["active"])
         hist_total = self.app.life.history_count()
         hist_pages = max(1, (hist_total + HIST_PER_PAGE - 1) // HIST_PER_PAGE)
@@ -839,6 +859,28 @@ class NotepadWindow(QWidget):
         self._sync_pager()
         self.setWindowTitle(f"智能手账 · {len([d for d in active if not d.get('depth')])} 条")
         self.update()
+
+    def _refresh_sync_badge(self) -> None:
+        """「待同步 N 条」: 只在配过对端之后才出现 —— 单机用户永远看不到它。
+
+        为什么撤不掉的待发行不算: 从没同步过的机器上所有操作都是 pending,
+        这时候显示"待同步 12 条"只会让人以为出错了。
+        """
+        try:
+            pending = int(self.app.store.outbox_count("pending"))
+            peers = int(self.app.store.peer_count())
+        except Exception:                      # 存储降级(内存模式)时不显示, 别让界面挂掉
+            pending, peers = 0, 0
+        text = f"待同步 {pending} 条" if (peers > 0 and pending > 0) else ""
+        if text == self._sync_badge:
+            return
+        self._sync_badge = text
+        self.sync_label.setText(text)
+        if text:
+            self.sync_label.setToolTip(
+                f"还有 {pending} 条改动没发到别的设备。\n"
+                "两端在同一 WiFi、对端用 --sync-listen 开着时会自动补发。")
+        self.sync_label.setVisible(bool(text) and not self._collapsed)
 
     def _hist_items(self, page_index: int) -> list[dict]:
         """历史第 `page_index` 页 (1 起) 的条目; 第 0 页是"今日手账", 没有历史条目。"""
@@ -881,6 +923,10 @@ class NotepadWindow(QWidget):
         p.drawText(QRect(theme.PADDING[0], 6, 180, 22), Qt.AlignLeft | Qt.AlignVCenter, title)
         p.setFont(theme.handwriting_font(10, bold=False))
         # 日期挪到标题右边: 右上角那排是 ＋/⚙/－/× 按钮, 半透明按钮底会让日期像乱码一样透出来
+        if self._sync_badge:
+            # 这一格让给"待同步 N 条"标签 (它是个真控件); 日期先不画, 否则两层字叠一起
+            p.end()
+            return
         stamp = datetime.now().strftime("%m-%d %H:%M") + ("  · 已收起" if self._collapsed else "")
         p.drawText(QRect(theme.PADDING[0] + 86, 6, 130, 22), Qt.AlignLeft | Qt.AlignVCenter, stamp)
         p.end()
